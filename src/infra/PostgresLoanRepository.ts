@@ -1,111 +1,156 @@
-import * as postgres from "postgres";
+import { Pool } from "pg";
 import { Loan } from "../domain/model/Loan";
 import { SharePie } from "../domain/model/SharePie";
+import { Share } from "../domain/model/SharePie";
 import * as dotenv from "dotenv";
 
 dotenv.config();
 
-// SSL接続が必要な場合が多いので require: true
-const sql = postgres(process.env.DATABASE_URL!, {
-  ssl: "require",
-  max: 50, // 並列数に合わせる
+// postgres.js ではなく、標準の pg (Pool) を使用
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10, // コネクションプール数
+  connectionTimeoutMillis: 30000, // ★ 10秒(10000) -> 30秒(30000) に増やす
+  idleTimeoutMillis: 30000, // ★ 追加: アイドル接続を切る時間
 });
 
 export class PostgresLoanRepository {
   // データ初期化 (Seed)
   async seed(count: number) {
-    // 1. パイの初期データ
-    const [pie] = await sql`
-      insert into share_pies default values returning id
-    `;
+    const client = await pool.connect();
+    try {
+      console.log("Seeding data...");
 
-    // 2. ローンの初期データ (大量挿入)
-    const loans = Array.from({ length: count }).map((_, i) => ({
-      id: `loan-${i}`,
-      amount: 1000,
-      share_pie_id: pie?.id,
-      version: 0,
-    }));
+      // 1. パイの初期データを作成
+      const resPie = await client.query(
+        "INSERT INTO share_pies DEFAULT VALUES RETURNING id"
+      );
+      const pieId = resPie.rows[0].id;
 
-    await sql`truncate table loans cascade`;
-    await sql`insert into loans ${sql(loans)}`;
+      // 2. データをクリア
+      await client.query("TRUNCATE TABLE loans CASCADE");
+
+      // 3. ローンの初期データ (大量挿入)
+      // pg で高速にやるため、VALUES句を生成する
+      const values: any[] = [];
+      const placeHolders: string[] = [];
+
+      for (let i = 0; i < count; i++) {
+        const offset = i * 4;
+        // ($1, $2, $3, $4) の形を作る
+        placeHolders.push(
+          `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4})`
+        );
+        values.push(`loan-${i}`, 1000, pieId, 0); // id, amount, share_pie_id, version
+      }
+
+      const query = `INSERT INTO loans (id, amount, share_pie_id, version) VALUES ${placeHolders.join(
+        ","
+      )}`;
+      await client.query(query, values);
+
+      console.log(`Seeding complete: ${count} records.`);
+    } finally {
+      client.release(); // 必ず解放する
+    }
   }
 
   // --- Read ---
   async findById(id: string): Promise<Loan | null> {
-    const result = await sql`
-      select l.*, s.id as pie_id 
-      from loans l 
-      join share_pies s on l.share_pie_id = s.id 
-      where l.id = ${id}
-    `;
+    const res = await pool.query(
+      `SELECT l.*, s.id as pie_id 
+       FROM loans l 
+       JOIN share_pies s ON l.share_pie_id = s.id 
+       WHERE l.id = $1`,
+      [id]
+    );
 
-    if (result.length === 0) return null;
-    const row = result[0];
+    if (res.rows.length === 0) return null;
+    const row = res.rows[0];
 
-    // 再構築 (簡易版)
-    const pie = new SharePie(row?.pie_id, []);
-    return new Loan(row?.id, pie, row?.version);
+    const dummyShare = new Share("db-owner", 1.0);
+    const pie = new SharePie(row.pie_id, [dummyShare]);
+
+    // amount がない場合は適当に 1000 とかにしておけばOK（ベンチマークに影響なし）
+    // もし Loan クラスで amount を求めているなら以下のように渡す
+    // (Moneyクラスがあるなら new Money(row.amount) など)
+    return new Loan(row.id, { amount: row.amount } as any, pie, row.version);
   }
 
   // --- Pattern A: CAS (DDD Style) ---
-  // 楽観ロック: Transactionを使わず、単発クエリの原子性を利用する
+  // 楽観ロック: Transactionを使わず、単発クエリでアトミック更新
   async saveCAS(loan: Loan, oldSharePieId: string): Promise<boolean> {
-    // 1. 新しいパイを保存 (Insert)
-    const [newPie] = await sql`
-      insert into share_pies default values returning id
-    `;
+    const client = await pool.connect();
+    try {
+      // 1. 新しいパイを保存 (Value Objectの不変性)
+      const resPie = await client.query(
+        "INSERT INTO share_pies DEFAULT VALUES RETURNING id"
+      );
+      const newPieId = resPie.rows[0].id;
 
-    // 2. CAS更新 (Update where old_id)
-    // ここが命。更新件数が0なら失敗とみなす
-    const result = await sql`
-      update loans 
-      set share_pie_id = ${newPie?.id},
-          version = version + 1
-      where id = ${loan.id} 
-        and share_pie_id = ${oldSharePieId}
-    `;
+      // 2. CAS更新 (Compare And Swap)
+      // バージョンもインクリメントしつつ、share_pie_id が古いままかチェック
+      const resUpdate = await client.query(
+        `UPDATE loans 
+         SET share_pie_id = $1,
+             version = version + 1
+         WHERE id = $2 
+           AND share_pie_id = $3`,
+        [newPieId, loan.id, oldSharePieId]
+      );
 
-    return result.count > 0;
+      // rowCount が 1 なら成功、0 なら誰かに先を越された(失敗)
+      return (resUpdate.rowCount ?? 0) > 0;
+    } finally {
+      client.release();
+    }
   }
 
   // --- Pattern B: Pessimistic (Select For Update) ---
-  // 悲観ロック: トランザクションを張り、ロックを取得する
-  // ※ベンチマークロジック側で tx を回すのは難しいので、
-  //   ここでは「ロックして更新して終わる」一連の流れを1メソッドで定義します
-  //   (実際のアプリではUseCaseでTransaction管理しますが、測定のため)
+  // 悲観ロック: トランザクションを張ってロックする
   async updateWithPessimisticLock(id: string): Promise<void> {
-    await sql.begin(async (sql) => {
-      // 1. Lock & Read
-      const [row] = await sql`
-        select share_pie_id from loans 
-        where id = ${id} 
-        for update
-      `;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN"); // トランザクション開始
 
-      if (!row) return; // 存在しない場合
+      // 1. Lock & Read (RTT 1)
+      const res = await client.query(
+        "SELECT share_pie_id FROM loans WHERE id = $1 FOR UPDATE",
+        [id]
+      );
 
-      // 2. App Logic Simulation (RTTの影響を見るため)
-      // Node.js側での処理時間を擬似的に待つならここに sleep を入れるが
-      // 今回は「通信RTT」が主役なので、あえて何もしない（DBとの往復回数勝負）
+      if (res.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return;
+      }
 
-      // 3. New Pie Insert
-      const [newPie] = await sql`
-        insert into share_pies default values returning id
-      `;
+      // 2. Logic & Insert (RTT 2)
+      // ここで本来アプリ側の計算時間が入る
+      const resPie = await client.query(
+        "INSERT INTO share_pies DEFAULT VALUES RETURNING id"
+      );
+      const newPieId = resPie.rows[0].id;
 
-      // 4. Update
-      await sql`
-        update loans 
-        set share_pie_id = ${newPie?.id},
-            version = version + 1
-        where id = ${id}
-      `;
-    });
+      // 3. Update (RTT 3)
+      await client.query(
+        `UPDATE loans 
+         SET share_pie_id = $1,
+             version = version + 1
+         WHERE id = $2`,
+        [newPieId, id]
+      );
+
+      await client.query("COMMIT"); // RTT 4
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 
-  // コネクション切断用
+  // 終了処理
   async close() {
-    await sql.end();
+    await pool.end();
   }
 }

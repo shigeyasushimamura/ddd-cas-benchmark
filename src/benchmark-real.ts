@@ -1,5 +1,7 @@
 import { PostgresLoanRepository } from "./infra/PostgresLoanRepository";
 import { Table } from "console-table-printer";
+import { Share } from "./domain/model/SharePie";
+import { SharePie } from "./domain/model/SharePie";
 
 const TOTAL_REQUESTS = 1000; // リアル通信なので少し減らす
 const CONCURRENCY = 20; // Supabaseの接続数制限に注意
@@ -26,12 +28,11 @@ async function runRealCAS() {
 
           const oldPieId = loan.sharePie.id!; // DB上のID
 
-          // 2. Logic (メモリ上)
-          loan.changeShare({} as any);
+          const newShares = [new Share("new-owner", 1.0)];
+          const newPie = new SharePie(null, newShares);
+          loan.changeShare(newPie);
 
-          // 3. CAS Write
           success = await repo.saveCAS(loan, oldPieId);
-
           if (!success) retries++;
         }
       })()

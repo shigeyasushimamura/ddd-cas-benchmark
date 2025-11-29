@@ -1,53 +1,64 @@
 // benchmark.js
 
-// 10MBの巨大な文字列を作成 (メモリ負荷をわかりやすくするため)
-// ※ 半角英数は1文字1バイトですが、JSの文字列は内部的にUTF-16なので、
-//   1000万文字は 実メモリで約20MB〜を消費します。
+// 約10MB（1,000万文字）の巨大な文字列を作成
+// ※ JavaScriptの文字列は内部的にUTF-16なので、
+//    実メモリでは約20MB〜を消費します
 const heavyString =
   "a".repeat(5 * 1024 * 1024) + "xyz123" + "b".repeat(5 * 1024 * 1024);
 
 // ----------------------------------------------------
 // 1. Stack版 (文字列コピーあり)
 // ----------------------------------------------------
-function testStack(s) {
-  const startMem = process.memoryUsage().heapUsed;
-
+function isPalindromeStack(s) {
   // ここで巨大なコピーが発生！
   const cleanStr = s.toLowerCase().replace(/[^a-z0-9]/g, "");
+
   const stack = [];
+  const len = cleanStr.length;
+  const mid = Math.floor(len / 2);
+
   // ここでさらに配列のメモリ確保！
-  for (let i = 0; i < cleanStr.length / 2; i++) {
+  for (let i = 0; i < mid; i++) {
     stack.push(cleanStr[i]);
   }
 
-  // 計測のために、処理中の「ピーク時」に近い状態を擬似的に測る
-  // (関数を抜けるとGC対象になってしまうため、処理中に測るのがポイント)
-  const currentMem = process.memoryUsage().heapUsed;
+  // 後半と照合
+  const startIndex = len % 2 === 0 ? mid : mid + 1;
+  for (let i = startIndex; i < len; i++) {
+    if (stack.pop() !== cleanStr[i]) {
+      return false;
+    }
+  }
 
-  // 実際のロジック（省略してもメモリ確保は終わっている）
-  // ...
-
-  return currentMem - startMem; // 増えた分を返す
+  return true;
 }
 
 // ----------------------------------------------------
 // 2. Two Pointers版 (コピーなし)
 // ----------------------------------------------------
-function testTwoPointers(s) {
-  const startMem = process.memoryUsage().heapUsed;
-
+function isPalindromeOptimized(s) {
   let left = 0;
   let right = s.length - 1;
 
-  // ロジック実行
   while (left < right) {
+    // 英数字以外をスキップ
+    while (left < right && !/[a-z0-9]/i.test(s[left])) {
+      left++;
+    }
+    while (left < right && !/[a-z0-9]/i.test(s[right])) {
+      right--;
+    }
+
     // 文字列生成も配列生成もしない
+    if (s[left].toLowerCase() !== s[right].toLowerCase()) {
+      return false;
+    }
+
     left++;
     right--;
   }
 
-  const currentMem = process.memoryUsage().heapUsed;
-  return currentMem - startMem;
+  return true;
 }
 
 // ----------------------------------------------------
@@ -57,27 +68,38 @@ console.log("🔥 メモリ使用量ベンチマーク (Node.js)");
 console.log(`📝 文字列サイズ: ${heavyString.length.toLocaleString()} 文字`);
 console.log("--------------------------------------------------");
 
-// GCの影響を避けるため、それぞれ別環境で測るのが理想ですが、
-// 簡易的に「Stack版」を先に測ります。
+// GCをできるだけ発動させてからベースライン取得
+if (global.gc) {
+  global.gc();
+}
 
-// ガベージコレクションを強制実行できればベストですが、
-// 通常のnode実行ではできないため、差分で判断します。
+// Stack版の計測
+const startMemStack = process.memoryUsage().heapUsed;
+const resultStack = isPalindromeStack(heavyString);
+const endMemStack = process.memoryUsage().heapUsed;
+const memoryDiffStack = endMemStack - startMemStack;
 
-const memoryDiffStack = testStack(heavyString);
-// バイト -> MB変換
-const mbStack = (memoryDiffStack / 1024 / 1024).toFixed(2);
-
-console.log(`[Stack版]`);
-console.log(`増えたメモリ: 約 ${mbStack} MB`);
-console.log(`(解説: 元の文字列のコピー + 配列生成でメモリを消費)`);
-
+console.log("[Stack版]");
+console.log(`結果: ${resultStack}`);
+console.log(
+  `増えたメモリ: 約 ${(memoryDiffStack / 1024 / 1024).toFixed(2)} MB`
+);
+console.log("(解説: 元の文字列のコピー + 配列生成でメモリを大量消費)");
 console.log("--------------------------------------------------");
 
-const memoryDiffOpt = testTwoPointers(heavyString);
-const mbOpt = (memoryDiffOpt / 1024 / 1024).toFixed(2);
+// GCを再度発動
+if (global.gc) {
+  global.gc();
+}
 
-console.log(`[Two Pointers版]`);
-console.log(`増えたメモリ: 約 ${mbOpt} MB`);
-console.log(`(解説: ほぼゼロに近い数値になるはず)`);
+// Two Pointers版の計測
+const startMemOpt = process.memoryUsage().heapUsed;
+const resultOpt = isPalindromeOptimized(heavyString);
+const endMemOpt = process.memoryUsage().heapUsed;
+const memoryDiffOpt = endMemOpt - startMemOpt;
 
+console.log("[Two Pointers版]");
+console.log(`結果: ${resultOpt}`);
+console.log(`増えたメモリ: 約 ${(memoryDiffOpt / 1024 / 1024).toFixed(2)} MB`);
+console.log("(解説: ポインタ変数のみでメモリ使用量はほぼゼロ)");
 console.log("--------------------------------------------------");

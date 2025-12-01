@@ -3,6 +3,10 @@ import { Table } from "console-table-printer";
 import { Share } from "./domain/model/SharePie";
 import { SharePie } from "./domain/model/SharePie";
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const LOGIC_TIME = 200; // 50msの計算時間をシミュレーション
+
 const TOTAL_REQUESTS = 1000; // リアル通信なので少し減らす
 const CONCURRENCY = 20; // Supabaseの接続数制限に注意
 const DATA_SIZE = 1000; // Random Access用
@@ -27,6 +31,9 @@ async function runRealCAS() {
           if (!loan) break;
 
           const oldPieId = loan.sharePie.id!; // DB上のID
+
+          // ★★★ 計算時間のシミュレーション (DB接続を掴んでいない！) ★★★
+          await sleep(LOGIC_TIME);
 
           const newShares = [new Share("new-owner", 1.0)];
           const newPie = new SharePie(null, newShares);

@@ -6,6 +6,8 @@ import * as dotenv from "dotenv";
 
 dotenv.config();
 
+// ★ sleep関数を定義
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 // postgres.js ではなく、標準の pg (Pool) を使用
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -123,6 +125,8 @@ export class PostgresLoanRepository {
         await client.query("ROLLBACK");
         return;
       }
+
+      await sleep(200);
 
       // 2. Logic & Insert (RTT 2)
       // ここで本来アプリ側の計算時間が入る
